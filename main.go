@@ -19,24 +19,57 @@ func main() {
 
 	r := mux.NewRouter()
 
-	// Health check endpoint
+	// Health check — no auth required
 	r.HandleFunc("/health", healthCheck).Methods("GET")
 
+	// All /api/v1 routes require Bearer token auth
+	api := r.PathPrefix("/api/v1").Subrouter()
+	api.Use(bearerAuth)
+
 	// Total usage snapshot endpoint (per-domain filtered, uses domain.txt)
-	r.HandleFunc("/api/v1/usage/total", getTotalUsage).Methods("GET")
+	api.HandleFunc("/usage/total", getTotalUsage).Methods("GET")
 
 	// Cluster-wide usage endpoint (all VMs in cluster, uses Nova API)
-	r.HandleFunc("/api/v1/usage/cluster", getClusterUsage).Methods("GET")
+	api.HandleFunc("/usage/cluster", getClusterUsage).Methods("GET")
 
 	// Billing endpoints
-	r.HandleFunc("/api/v1/billing/cpu/{instance_id}", getCPUBilling).Methods("GET")
-	r.HandleFunc("/api/v1/billing/resources/{instance_id}", getResourceBilling).Methods("GET")
-	r.HandleFunc("/api/v1/billing/report/{instance_id}", getBillingReport).Methods("GET")
+	api.HandleFunc("/billing/cpu/{instance_id}", getCPUBilling).Methods("GET")
+	api.HandleFunc("/billing/resources/{instance_id}", getResourceBilling).Methods("GET")
+	api.HandleFunc("/billing/report/{instance_id}", getBillingReport).Methods("GET")
 
 	// Server configuration
-	port := ":8080"
-	log.Printf("Starting billing API server on port %s", port)
-	log.Fatal(http.ListenAndServe(port, r))
+	port := getEnv("PORT", "8080")
+	log.Printf("Starting billing API server on port :%s", port)
+	log.Fatal(http.ListenAndServe(":"+port, r))
+}
+
+// bearerAuth is a middleware that validates the Authorization: Bearer <token> header
+// against the API_BEARER_TOKEN environment variable.
+func bearerAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		expected := getEnv("API_BEARER_TOKEN", "")
+		if expected == "" {
+			log.Printf("ERROR: API_BEARER_TOKEN is not configured")
+			http.Error(w, `{"error":"server misconfiguration"}`, http.StatusInternalServerError)
+			return
+		}
+
+		auth := r.Header.Get("Authorization")
+		if auth == "" || len(auth) < 8 || auth[:7] != "Bearer " {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="VHI Billing API"`)
+			http.Error(w, `{"error":"missing or invalid Authorization header"}`, http.StatusUnauthorized)
+			return
+		}
+
+		token := auth[7:]
+		if token != expected {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="VHI Billing API"`)
+			http.Error(w, `{"error":"invalid bearer token"}`, http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func healthCheck(w http.ResponseWriter, r *http.Request) {

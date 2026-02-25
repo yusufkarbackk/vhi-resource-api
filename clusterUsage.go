@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -20,30 +22,39 @@ type ClusterUsage struct {
 	ShelvedVMs int `json:"shelved_vms"`
 	OtherVMs   int `json:"other_vms"`
 
-	// Cluster capacity (from hypervisor stats)
-	TotalVCPUs  int     `json:"total_vcpus"`   // Total vCPUs capacity (physical * overcommit ratio)
-	TotalRAMGiB float64 `json:"total_ram_gib"` // Total RAM capacity
+	// Cluster capacity (sum of individual hypervisors)
+	TotalVCPUs  int     `json:"total_vcpus"`
+	TotalRAMTiB float64 `json:"total_ram_tib"`
 
-	// Reserved = resources actually occupying hypervisor (Active + Shutoff only)
+	// Fenced capacity (nodes that are down)
+	FencedVCPUs  int     `json:"fenced_vcpus"`
+	FencedRAMGiB float64 `json:"fenced_ram_gib"`
+
+	// Reserved = resources on hypervisor (Active + Shutoff only)
 	ReservedVCPUs  int     `json:"reserved_vcpus"`
 	ReservedRAMGiB float64 `json:"reserved_ram_gib"`
 
-	// System = used by hypervisor/system overhead
+	// System = hypervisor/system overhead
 	SystemVCPUs  int     `json:"system_vcpus"`
 	SystemRAMGiB float64 `json:"system_ram_gib"`
 
-	// Free = Total - System - Reserved
+	// Free = Total - Used
 	FreeVCPUs  int     `json:"free_vcpus"`
 	FreeRAMGiB float64 `json:"free_ram_gib"`
+
+	// Provisioned storage (from VHI panel stat)
+	ProvisionedStorageTiB float64 `json:"provisioned_storage_tib"`
+	StorageUsedTiB        float64 `json:"storage_used_tib"`
+	StorageFreeTiB        float64 `json:"storage_free_tib"`
+
+	StorageError string `json:"storage_error,omitempty"`
 }
 
 // GET /api/v1/usage/cluster
-// Mendapatkan total resource usage dari SELURUH cluster menggunakan Nova Compute API.
 func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
-	// 1. Login admin ke Keystone
 	adminToken, err := GetAdminToken(ctx)
 	if err != nil {
 		log.Printf("Error: failed to get admin token: %v", err)
@@ -51,7 +62,68 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Buat Nova client
+	// ---- Try VHI Panel stat (primary source, exact dashboard data) ----
+	panelURL := getEnv("VHI_PANEL_URL", "")
+	var response ClusterUsage
+
+	if panelURL != "" {
+		panelClient := NewVHIPanelClient(VHIPanelConfig{
+			BaseURL:  panelURL,
+			Username: getEnv("ADMIN_USERNAME", "admin"),
+			Password: getEnv("ADMIN_PASSWORD", ""),
+			Domain:   getEnv("ADMIN_DOMAIN_NAME", "Default"),
+			Insecure: true,
+		})
+
+		stat, panelErr := panelClient.GetStat()
+		if panelErr != nil {
+			log.Printf("Warning: VHI Panel stat failed: %v, falling back to Nova", panelErr)
+		} else {
+			// Panel stat available - use exact dashboard data
+			bytesToGiB := 1024.0 * 1024.0 * 1024.0
+			bytesToTiB := bytesToGiB * 1024.0
+
+			response = ClusterUsage{
+				Timestamp:  time.Now().Format(time.RFC3339),
+				TotalVMs:   stat.Servers.Count,
+				ActiveVMs:  stat.Servers.Active,
+				ShutoffVMs: stat.Servers.Shutoff,
+				ShelvedVMs: stat.Servers.ShelvedOffloaded,
+				OtherVMs:   stat.Servers.Error + stat.Servers.InProgress,
+
+				TotalVCPUs:  stat.Physical.VCPUsTotal,
+				TotalRAMTiB: math.Ceil(float64(stat.Physical.MemTotal)/bytesToTiB*100) / 100,
+
+				FencedVCPUs:  stat.Fenced.VCPUs,
+				FencedRAMGiB: math.Ceil(float64(stat.Fenced.PhysicalMemTotal) / bytesToGiB),
+
+				ReservedVCPUs:  stat.Compute.VCPUs,
+				ReservedRAMGiB: math.Ceil(float64(stat.Compute.VmMemReserved) / bytesToGiB),
+
+				SystemVCPUs:  stat.Reserved.VCPUs,
+				SystemRAMGiB: math.Ceil(float64(stat.Reserved.Memory) / bytesToGiB),
+
+				FreeVCPUs:  stat.Compute.VCPUsFree,
+				FreeRAMGiB: math.Ceil(float64(stat.Compute.VmMemFree) / bytesToGiB),
+
+				ProvisionedStorageTiB: math.Ceil(float64(stat.Compute.BlockCapacity)/bytesToTiB*100) / 100,
+				StorageUsedTiB:        math.Ceil(float64(stat.Compute.BlockUsage)/bytesToTiB*100) / 100,
+				StorageFreeTiB:        math.Ceil(float64(stat.Compute.BlockCapacity-stat.Compute.BlockUsage)/bytesToTiB*100) / 100,
+			}
+
+			log.Printf("Using VHI Panel stat: Total=%d vCPUs | System=%d | VMs=%d | Free=%d | Fenced=%d | Storage=%.2f TiB",
+				response.TotalVCPUs, response.SystemVCPUs, response.ReservedVCPUs,
+				response.FreeVCPUs, response.FencedVCPUs, response.ProvisionedStorageTiB)
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(response)
+			return
+		}
+	}
+
+	// ---- Fallback: Nova + Gnocchi calculations ----
+	log.Printf("Using fallback: Nova hypervisors + Gnocchi/Cinder")
+
 	novaURL := getEnv("NOVA_URL", "")
 	novaClient := NewNovaClient(NovaConfig{
 		BaseURL:  novaURL,
@@ -59,22 +131,66 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 		Insecure: true,
 	})
 
-	// 3. Ambil hypervisor statistics (cluster capacity)
-	log.Println("Fetching hypervisor statistics...")
-	hyperStats, err := novaClient.GetHypervisorStats()
+	hypervisors, err := novaClient.GetHypervisors()
 	if err != nil {
-		log.Printf("Error: failed to get hypervisor stats: %v", err)
-		http.Error(w, fmt.Sprintf("failed to get hypervisor stats: %v", err), http.StatusInternalServerError)
+		log.Printf("Error: failed to get hypervisors: %v", err)
+		http.Error(w, fmt.Sprintf("failed to get hypervisors: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	totalVCPUs := hyperStats.VCPUs
-	totalRAMGiB := float64(hyperStats.MemoryMB) / 1024.0
+	overcommitStr := getEnv("OVERCOMMIT_RATIO", "8")
+	vCPUOvercommit, err := strconv.ParseFloat(overcommitStr, 64)
+	if err != nil {
+		vCPUOvercommit = 8.0
+	}
+	ramOvercommit := 1.0
 
-	log.Printf("Hypervisor capacity: %d vCPUs, %.2f GiB RAM (%d hypervisors)", totalVCPUs, totalRAMGiB, hyperStats.Count)
+	var physicalVCPUs, fencedPhysicalVCPUs, activePhysicalVCPUs int
+	var physicalRAMMB, fencedPhysicalRAMMB, activePhysicalRAMMB int
+	var activeFreeRAMMB int
+	var activeVCPUsUsed, activeRAMMBUsed int
 
-	// 4. Ambil semua servers dari Nova
-	log.Println("Fetching all servers from Nova (all_tenants=true)...")
+	for _, hyp := range hypervisors {
+		physicalVCPUs += hyp.VCPUs
+		physicalRAMMB += hyp.MemoryMB
+
+		if hyp.State == "down" || hyp.Status == "disabled" {
+			fencedPhysicalVCPUs += hyp.VCPUs
+			fencedPhysicalRAMMB += hyp.MemoryMB
+		} else {
+			activePhysicalVCPUs += hyp.VCPUs
+			activePhysicalRAMMB += hyp.MemoryMB
+			activeFreeRAMMB += hyp.FreeRAMMB
+			activeVCPUsUsed += hyp.VCPUsUsed
+			activeRAMMBUsed += hyp.MemoryMBUsed
+		}
+	}
+
+	totalVCPUs := int(float64(physicalVCPUs) * vCPUOvercommit)
+	totalRAMGiB := (float64(physicalRAMMB) / 1024.0) * ramOvercommit
+	fencedVCPUs := int(float64(fencedPhysicalVCPUs) * vCPUOvercommit)
+	fencedRAMGiB := (float64(fencedPhysicalRAMMB) / 1024.0) * ramOvercommit
+	activeTotalVCPUs := int(float64(activePhysicalVCPUs) * vCPUOvercommit)
+	activeTotalRAMGiB := (float64(activePhysicalRAMMB) / 1024.0) * ramOvercommit
+
+	// Gnocchi provisioned storage
+	gnocchiURL := getEnv("GNOCCHI_URL", "")
+	var provisionedTiB float64
+	if gnocchiURL != "" {
+		gnocchiClient := NewGnocchiClient(GnocchiConfig{
+			BaseURL:  gnocchiURL,
+			Token:    adminToken,
+			Insecure: true,
+		})
+		gnocchiStorage, gnocchiErr := gnocchiClient.GetProvisionedStorage()
+		if gnocchiErr != nil {
+			log.Printf("Warning: Gnocchi failed: %v", gnocchiErr)
+		} else {
+			provisionedTiB = gnocchiStorage.TotalTiB
+		}
+	}
+
+	// Nova servers
 	servers, err := novaClient.ListAllServers()
 	if err != nil {
 		log.Printf("Error: failed to list servers from Nova: %v", err)
@@ -82,11 +198,7 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Found %d total servers in cluster", len(servers))
-
-	// 5. Hitung reserved resource (Active + Shutoff only)
-	var reservedVCPUs int
-	var reservedRAMMB int
+	var reservedVCPUs, reservedRAMMB int
 	var activeVMs, shutoffVMs, shelvedVMs, otherVMs int
 
 	for _, server := range servers {
@@ -97,49 +209,33 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 			reservedRAMMB += server.Flavor.RAM
 		case "SHUTOFF":
 			shutoffVMs++
-			reservedVCPUs += server.Flavor.VCPUs
-			reservedRAMMB += server.Flavor.RAM
 		case "SHELVED_OFFLOADED", "SHELVED":
 			shelvedVMs++
 		default:
 			otherVMs++
-			reservedVCPUs += server.Flavor.VCPUs
-			reservedRAMMB += server.Flavor.RAM
 		}
 	}
 
 	reservedRAMGiB := float64(reservedRAMMB) / 1024.0
+	freeRAMGiB := float64(activeFreeRAMMB) / 1024.0
 
-	// 6. Hitung system dan free
-	// System = hypervisor used - VM reserved (overhead dari OS/hypervisor)
-	systemVCPUs := hyperStats.VCPUsUsed - reservedVCPUs
+	systemRAMGiB := (float64(activeRAMMBUsed) / 1024.0) - reservedRAMGiB
+	if systemRAMGiB < 0 {
+		systemRAMGiB = 0
+	}
+
+	freeRatio := 0.0
+	if activeTotalRAMGiB > 0 {
+		freeRatio = freeRAMGiB / activeTotalRAMGiB
+	}
+	freeVCPUs := int(freeRatio * float64(activeTotalVCPUs))
+
+	systemVCPUs := activeTotalVCPUs - freeVCPUs - reservedVCPUs
 	if systemVCPUs < 0 {
 		systemVCPUs = 0
 	}
-	systemRAMMB := hyperStats.MemoryMBUsed - reservedRAMMB
-	if systemRAMMB < 0 {
-		systemRAMMB = 0
-	}
-	systemRAMGiB := float64(systemRAMMB) / 1024.0
 
-	// Free = Total - Used (used includes system + VMs)
-	freeVCPUs := totalVCPUs - hyperStats.VCPUsUsed
-	if freeVCPUs < 0 {
-		freeVCPUs = 0
-	}
-	freeRAMGiB := float64(hyperStats.FreeRAMMB) / 1024.0
-
-	log.Printf("========================================")
-	log.Printf("Cluster: %d vCPUs total, %d hypervisors", totalVCPUs, hyperStats.Count)
-	log.Printf("  System: %d vCPUs, %.2f GiB RAM", systemVCPUs, systemRAMGiB)
-	log.Printf("  VMs:    %d vCPUs, %.2f GiB RAM", reservedVCPUs, reservedRAMGiB)
-	log.Printf("  Free:   %d vCPUs, %.2f GiB RAM", freeVCPUs, freeRAMGiB)
-	log.Printf("  VMs: %d total (Active: %d, Shutoff: %d, Shelved: %d, Other: %d)",
-		len(servers), activeVMs, shutoffVMs, shelvedVMs, otherVMs)
-	log.Printf("========================================")
-
-	// 7. Return response
-	response := ClusterUsage{
+	response = ClusterUsage{
 		Timestamp:      time.Now().Format(time.RFC3339),
 		TotalVMs:       len(servers),
 		ActiveVMs:      activeVMs,
@@ -147,13 +243,17 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 		ShelvedVMs:     shelvedVMs,
 		OtherVMs:       otherVMs,
 		TotalVCPUs:     totalVCPUs,
-		TotalRAMGiB:    totalRAMGiB,
+		TotalRAMTiB:    math.Ceil(totalRAMGiB/1024.0*100) / 100,
 		ReservedVCPUs:  reservedVCPUs,
-		ReservedRAMGiB: reservedRAMGiB,
+		ReservedRAMGiB: math.Ceil(reservedRAMGiB),
+		FencedVCPUs:    fencedVCPUs,
+		FencedRAMGiB:   math.Ceil(fencedRAMGiB),
 		SystemVCPUs:    systemVCPUs,
-		SystemRAMGiB:   systemRAMGiB,
+		SystemRAMGiB:   math.Ceil(systemRAMGiB),
 		FreeVCPUs:      freeVCPUs,
-		FreeRAMGiB:     freeRAMGiB,
+		FreeRAMGiB:     math.Ceil(freeRAMGiB),
+
+		ProvisionedStorageTiB: provisionedTiB,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

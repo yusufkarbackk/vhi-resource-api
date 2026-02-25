@@ -40,3 +40,5 @@ logs/
 # Build artifacts
 build/
 dist/
+vhi-billing-api.service
+vhi-billing-api.exe

@@ -22,12 +22,12 @@
 
 ### dokumentasi
 
-- resource dari platform VHI
 - https://docs.openstack.org/2025.2/api/
 - https://docs.virtuozzo.com/virtuozzo_hybrid_infrastructure_7_2_compute_api_reference/index.html
 - https://gnocchi.osci.io/rest.html
 - https://docs.openstack.org/newton/cli-reference/gnocchi.html
-
+- cinder: https://docs.openstack.org/api-ref/block-storage/v3/
+- provisioned storage space: https://docs.virtuozzo.com/virtuozzo_infrastructure_7_2_compute_api_reference/index.html#aggregating-provisioned-storage-space.html
 
 ### autentikasi
 

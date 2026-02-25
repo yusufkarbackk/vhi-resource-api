@@ -16,6 +16,10 @@ import (
 	"time"
 )
 
+// adminProjectID stores the admin project ID extracted from the Keystone token response.
+// Used by Cinder API which requires project_id in the URL path.
+var adminProjectID string
+
 // DomainConfig merepresentasikan satu baris konfigurasi domain/project untuk login Keystone.
 // Format file (per baris):
 //
@@ -281,6 +285,22 @@ func (c *KeystoneClient) getAdminToken(ctx context.Context, creds AdminCredentia
 	token := resp.Header.Get("X-Subject-Token")
 	if token == "" {
 		return "", fmt.Errorf("keystone admin response missing X-Subject-Token header")
+	}
+
+	// Parse response body to extract project_id
+	var tokenResp struct {
+		Token struct {
+			Project struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"project"`
+		} `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		log.Printf("Warning: could not parse token response body for project_id: %v", err)
+	} else {
+		adminProjectID = tokenResp.Token.Project.ID
+		log.Printf("Admin project ID: %s (name: %s)", adminProjectID, tokenResp.Token.Project.Name)
 	}
 
 	return token, nil

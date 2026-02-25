@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 )
@@ -196,4 +198,122 @@ type GnocchiInstance struct {
 	DisplayName string            `json:"display_name"`
 	Metrics     map[string]string `json:"metrics"`
 	ProjectID   string            `json:"project_id"`
+}
+
+// GnocchiProvisionedStorage berisi hasil aggregate provisioned storage dari Gnocchi.
+type GnocchiProvisionedStorage struct {
+	TotalGiB float64 // Sum of volume.size across all volumes (in GiB)
+	TotalTiB float64 // Converted to TiB
+}
+
+// gnocchiAggregateResponse represents the response from POST /v1/aggregates
+type gnocchiAggregateResponse struct {
+	Measures struct {
+		Aggregated [][]interface{} `json:"aggregated"` // [[timestamp, granularity, value], ...]
+	} `json:"measures"`
+}
+
+// GetProvisionedStorage mengambil total provisioned storage dari Gnocchi
+// menggunakan endpoint POST /v1/aggregates dengan metric volume.size.
+// Ini adalah cara yang sama yang digunakan dashboard VHI.
+func (c *GnocchiClient) GetProvisionedStorage() (*GnocchiProvisionedStorage, error) {
+	// Use current time range - get the latest data point
+	now := time.Now().UTC()
+	// Look back 1 hour to get the most recent measurement
+	start := now.Add(-1 * time.Hour).Format("2006-01-02T15:04:05")
+	stop := now.Format("2006-01-02T15:04:05")
+
+	// Gnocchi BaseURL from env already includes /v1 (e.g. https://10.21.0.240:8041/v1)
+	// Do not add /v1 again
+	url := fmt.Sprintf("%s/aggregates?details=False&needed_overlap=0.0&start=%s&stop=%s",
+		c.config.BaseURL, start, stop)
+
+	// Request body per VHI documentation
+	// search: empty object {} = match all volumes across all projects (cluster-wide)
+	body := map[string]interface{}{
+		"operations":    "(aggregate sum (metric volume.size mean))",
+		"search":        map[string]interface{}{},
+		"resource_type": "volume",
+	}
+
+	bodyJSON, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request body: %w", err)
+	}
+
+	log.Printf("Gnocchi aggregates URL: %s", url)
+	log.Printf("Gnocchi aggregates body: %s", string(bodyJSON))
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyJSON))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("X-Auth-Token", c.config.Token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	log.Printf("Gnocchi aggregates response status: %d", resp.StatusCode)
+	log.Printf("Gnocchi aggregates response: %s", string(respBody))
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Parse response - try the documented format first
+	var result gnocchiAggregateResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		// Try parsing as a raw array (some Gnocchi versions return differently)
+		var rawArray [][]interface{}
+		if err2 := json.Unmarshal(respBody, &rawArray); err2 != nil {
+			return nil, fmt.Errorf("failed to decode response: %w (raw: %s)", err, string(respBody))
+		}
+		// Use the last (most recent) data point
+		if len(rawArray) > 0 {
+			last := rawArray[len(rawArray)-1]
+			if len(last) >= 3 {
+				if val, ok := last[2].(float64); ok {
+					log.Printf("Gnocchi provisioned storage (raw array): %.2f GiB = %.4f TiB", val, val/1024.0)
+					return &GnocchiProvisionedStorage{
+						TotalGiB: val,
+						TotalTiB: val / 1024.0,
+					}, nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("no data points in response")
+	}
+
+	// Use the last (most recent) data point from measures.aggregated
+	aggregated := result.Measures.Aggregated
+	if len(aggregated) == 0 {
+		return nil, fmt.Errorf("no aggregated data points returned")
+	}
+
+	last := aggregated[len(aggregated)-1]
+	if len(last) < 3 {
+		return nil, fmt.Errorf("invalid data point format")
+	}
+
+	value, ok := last[2].(float64)
+	if !ok {
+		return nil, fmt.Errorf("invalid value type in data point")
+	}
+
+	log.Printf("Gnocchi provisioned storage: %.2f GiB = %.4f TiB", value, value/1024.0)
+
+	return &GnocchiProvisionedStorage{
+		TotalGiB: value,
+		TotalTiB: value / 1024.0,
+	}, nil
 }

@@ -53,9 +53,29 @@ type HypervisorStats struct {
 	MemoryMBUsed int `json:"memory_mb_used"` // RAM currently used in MB
 	FreeRAMMB    int `json:"free_ram_mb"`    // Free RAM in MB
 	RunningVMs   int `json:"running_vms"`
-	FreeDiskGB   int `json:"free_disk_gb"`
 	LocalGB      int `json:"local_gb"`
 	LocalGBUsed  int `json:"local_gb_used"`
+}
+
+// Hypervisor merepresentasikan satu hypervisor node.
+type Hypervisor struct {
+	ID                 int    `json:"id"`
+	Status             string `json:"status"` // enabled, disabled
+	State              string `json:"state"`  // up, down
+	VCPUs              int    `json:"vcpus"`
+	MemoryMB           int    `json:"memory_mb"`
+	LocalGB            int    `json:"local_gb"`
+	VCPUsUsed          int    `json:"vcpus_used"`
+	MemoryMBUsed       int    `json:"memory_mb_used"`
+	LocalGBUsed        int    `json:"local_gb_used"`
+	FreeRAMMB          int    `json:"free_ram_mb"`
+	FreeDiskGB         int    `json:"free_disk_gb"`
+	HypervisorHostname string `json:"hypervisor_hostname"`
+}
+
+// hypervisorsResponse adalah response dari GET /os-hypervisors/detail
+type hypervisorsResponse struct {
+	Hypervisors []Hypervisor `json:"hypervisors"`
 }
 
 type hypervisorStatsResponse struct {
@@ -111,6 +131,38 @@ func (c *NovaClient) GetHypervisorStats() (*HypervisorStats, error) {
 	}
 
 	return &result.HypervisorStatistics, nil
+}
+
+// GetHypervisors mengambil daftar detail semua hypervisors.
+// GET /v2.1/os-hypervisors/detail
+func (c *NovaClient) GetHypervisors() ([]Hypervisor, error) {
+	url := fmt.Sprintf("%s/v2.1/os-hypervisors/detail", c.config.BaseURL)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create hypervisors request: %w", err)
+	}
+
+	req.Header.Set("X-Auth-Token", c.config.Token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute hypervisors request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("hypervisors returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result hypervisorsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode hypervisors: %w", err)
+	}
+
+	return result.Hypervisors, nil
 }
 
 // ListAllServers mengambil semua servers di cluster menggunakan
