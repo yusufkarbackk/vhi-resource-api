@@ -42,10 +42,15 @@ type ClusterUsage struct {
 	FreeVCPUs  int     `json:"free_vcpus"`
 	FreeRAMGiB float64 `json:"free_ram_gib"`
 
-	// Provisioned storage (from VHI panel stat)
+	// Provisioned storage (compute block storage from VHI panel stat)
 	ProvisionedStorageTiB float64 `json:"provisioned_storage_tib"`
 	StorageUsedTiB        float64 `json:"storage_used_tib"`
 	StorageFreeTiB        float64 `json:"storage_free_tib"`
+
+	// Logical storage (vstorage cluster — matches vstorage CLI: 287TB of 377TB)
+	LogicalStorageTotalTiB float64 `json:"logical_storage_total_tib"`
+	LogicalStorageUsedTiB  float64 `json:"logical_storage_used_tib"`
+	LogicalStorageFreeTiB  float64 `json:"logical_storage_free_tib"`
 
 	StorageError string `json:"storage_error,omitempty"`
 }
@@ -100,6 +105,15 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 				ProvisionedStorageTiB: math.Ceil(float64(stat.Compute.BlockCapacity)/bytesToTiB*100) / 100,
 				StorageUsedTiB:        math.Ceil(float64(stat.Compute.BlockUsage)/bytesToTiB*100) / 100,
 				StorageFreeTiB:        math.Ceil(float64(stat.Compute.BlockCapacity-stat.Compute.BlockUsage)/bytesToTiB*100) / 100,
+			}
+
+			// Also fetch logical (vstorage) storage cluster stat
+			if storageStat, storageErr := panelClient.GetStorageStat(); storageErr != nil {
+				log.Printf("Warning: VHI Panel storage stat failed: %v", storageErr)
+			} else {
+				response.LogicalStorageTotalTiB = math.Round(float64(storageStat.Space.AllocatableTotal)/bytesToTiB*100) / 100
+				response.LogicalStorageUsedTiB = math.Round(float64(storageStat.Space.AllocatableUsed)/bytesToTiB*100) / 100
+				response.LogicalStorageFreeTiB = math.Round(float64(storageStat.Space.AllocatableFree)/bytesToTiB*100) / 100
 			}
 
 			log.Printf("Using VHI Panel stat: Total=%d vCPUs | System=%d | VMs=%d | Free=%d | Fenced=%d | Storage=%.2f TiB",

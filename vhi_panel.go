@@ -88,6 +88,26 @@ type PanelStat struct {
 	} `json:"volumes"`
 }
 
+// StorageClusterStat represents the /api/v2/storage/cluster/stat response.
+// This is the logical storage layer (vcpus, allocatable, free) — matches vstorage CLI output.
+type StorageClusterStat struct {
+	Cluster struct {
+		Name string `json:"name"`
+	} `json:"cluster"`
+	Space struct {
+		AllocatableTotal int64 `json:"allocatable_total"` // bytes — "377TB"
+		AllocatableUsed  int64 `json:"allocatable_used"`  // bytes — "287TB"
+		AllocatableFree  int64 `json:"allocatable_free"`  // bytes — "314TB free"
+		PhysicalTotal    int64 `json:"physical_total"`    // bytes — "386TB"
+		PhysicalFree     int64 `json:"physical_free"`     // bytes
+	} `json:"space"`
+	License struct {
+		Capacity int64  `json:"capacity"` // bytes
+		Used     int64  `json:"used"`     // bytes
+		Status   string `json:"status"`
+	} `json:"license"`
+}
+
 // NewVHIPanelClient creates a new VHI panel API client.
 func NewVHIPanelClient(config VHIPanelConfig) *VHIPanelClient {
 	tr := &http.Transport{}
@@ -183,51 +203,64 @@ func (c *VHIPanelClient) Login() error {
 	return fmt.Errorf("login succeeded but no usable token in response: %s", string(body))
 }
 
+// doAuthGet performs a GET request with auth headers, auto re-login on 401.
+func (c *VHIPanelClient) doAuthGet(endpoint string) ([]byte, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		if c.token == "" {
+			if err := c.Login(); err != nil {
+				return nil, fmt.Errorf("panel login failed: %w", err)
+			}
+		}
+
+		url := fmt.Sprintf("%s%s", c.config.BaseURL, endpoint)
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		req.Header.Set("X-Auth-Token", c.token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		req.Header.Set("X-Session-Id", "0")
+		for _, cookie := range c.cookies {
+			cp := *cookie
+			if cp.Name == "session" {
+				cp.Name = "session0"
+			}
+			req.AddCookie(&cp)
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("request failed: %w", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		log.Printf("VHI Panel %s response status: %d", endpoint, resp.StatusCode)
+
+		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
+			// Token expired — force re-login and retry once
+			log.Printf("VHI Panel token expired, re-logging in...")
+			c.token = ""
+			c.cookies = nil
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("request returned status %d: %s", resp.StatusCode, string(body))
+		}
+		return body, nil
+	}
+	return nil, fmt.Errorf("request failed after re-login")
+}
+
 // GetStat retrieves the cluster statistics from the VHI panel.
 // This returns the exact same data shown on the VHI dashboard.
 func (c *VHIPanelClient) GetStat() (*PanelStat, error) {
-	// Login first if no token
-	if c.token == "" {
-		if err := c.Login(); err != nil {
-			return nil, fmt.Errorf("panel login failed: %w", err)
-		}
-	}
-
-	url := fmt.Sprintf("%s/api/v2/compute/cluster/stat", c.config.BaseURL)
-
-	req, err := http.NewRequest("GET", url, nil)
+	body, err := c.doAuthGet("/api/v2/compute/cluster/stat")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("X-Auth-Token", c.token)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("X-Session-Id", "0")
-
-	// Manually attach session cookies from login
-	// Rename "session" to "session0" to match X-Session-Id: 0
-	for _, cookie := range c.cookies {
-		c := *cookie
-		if c.Name == "session" {
-			c.Name = "session0"
-		}
-		req.AddCookie(&c)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	log.Printf("VHI Panel stat response status: %d", resp.StatusCode)
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("stat returned status %d: %s", resp.StatusCode, string(body))
+		return nil, err
 	}
 
 	var stat PanelStat
@@ -238,6 +271,28 @@ func (c *VHIPanelClient) GetStat() (*PanelStat, error) {
 	log.Printf("VHI Panel stat: vCPUs=%d, System=%d, Free=%d, Fenced=%d, Block=%.2f TiB",
 		stat.Compute.VCPUs, stat.Reserved.VCPUs, stat.Compute.VCPUsFree,
 		stat.Fenced.VCPUs, float64(stat.Compute.BlockCapacity)/1099511627776.0)
+
+	return &stat, nil
+}
+
+// GetStorageStat retrieves logical storage cluster statistics from /api/v2/storage/cluster/stat.
+// This returns allocatable/used/free storage matching the vstorage CLI output (e.g. 287TB of 377TB).
+func (c *VHIPanelClient) GetStorageStat() (*StorageClusterStat, error) {
+	body, err := c.doAuthGet("/api/v2/storage/cluster/stat")
+	if err != nil {
+		return nil, err
+	}
+
+	var stat StorageClusterStat
+	if err := json.Unmarshal(body, &stat); err != nil {
+		return nil, fmt.Errorf("failed to decode storage stat response: %w (body: %s)", err, string(body))
+	}
+
+	bytesToTiB := 1024.0 * 1024.0 * 1024.0 * 1024.0
+	log.Printf("VHI Panel storage: AllocTotal=%.1f TiB, AllocUsed=%.1f TiB, AllocFree=%.1f TiB",
+		float64(stat.Space.AllocatableTotal)/bytesToTiB,
+		float64(stat.Space.AllocatableUsed)/bytesToTiB,
+		float64(stat.Space.AllocatableFree)/bytesToTiB)
 
 	return &stat, nil
 }
