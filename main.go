@@ -11,10 +11,28 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// panelClient is a singleton initialized once at startup.
+// Re-using the client across requests avoids re-login on every call.
+var panelClient *VHIPanelClient
+
 func main() {
 	// Load .env file at startup so all getEnv() calls can read values
 	if err := godotenv.Load("./.env"); err != nil {
 		log.Printf("Warning: could not load .env file: %v", err)
+	}
+
+	// Initialize VHI panel client singleton (login once at startup)
+	if url := getEnv("VHI_PANEL_URL", ""); url != "" {
+		panelClient = NewVHIPanelClient(VHIPanelConfig{
+			BaseURL:  url,
+			Username: getEnv("ADMIN_USERNAME", "admin"),
+			Password: getEnv("ADMIN_PASSWORD", ""),
+			Domain:   getEnv("ADMIN_DOMAIN_NAME", "Default"),
+			Insecure: true,
+		})
+		if err := panelClient.Login(); err != nil {
+			log.Printf("Warning: VHI Panel initial login failed: %v", err)
+		}
 	}
 
 	r := mux.NewRouter()

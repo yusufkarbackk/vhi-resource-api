@@ -63,18 +63,9 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ---- Try VHI Panel stat (primary source, exact dashboard data) ----
-	panelURL := getEnv("VHI_PANEL_URL", "")
 	var response ClusterUsage
 
-	if panelURL != "" {
-		panelClient := NewVHIPanelClient(VHIPanelConfig{
-			BaseURL:  panelURL,
-			Username: getEnv("ADMIN_USERNAME", "admin"),
-			Password: getEnv("ADMIN_PASSWORD", ""),
-			Domain:   getEnv("ADMIN_DOMAIN_NAME", "Default"),
-			Insecure: true,
-		})
-
+	if panelClient != nil {
 		stat, panelErr := panelClient.GetStat()
 		if panelErr != nil {
 			log.Printf("Warning: VHI Panel stat failed: %v, falling back to Nova", panelErr)
