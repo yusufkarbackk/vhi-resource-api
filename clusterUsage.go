@@ -107,13 +107,13 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 				StorageFreeTiB:        math.Ceil(float64(stat.Compute.BlockCapacity-stat.Compute.BlockUsage)/bytesToTiB*100) / 100,
 			}
 
-			// Also fetch logical (vstorage) storage cluster stat
+			// Also fetch logical (vstorage) storage cluster stat via Prometheus/Grafana
 			if storageStat, storageErr := panelClient.GetStorageStat(); storageErr != nil {
 				log.Printf("Warning: VHI Panel storage stat failed: %v", storageErr)
 			} else {
-				response.LogicalStorageTotalTiB = math.Round(float64(storageStat.Space.AllocatableTotal)/bytesToTiB*100) / 100
-				response.LogicalStorageUsedTiB = math.Round(float64(storageStat.Space.AllocatableUsed)/bytesToTiB*100) / 100
-				response.LogicalStorageFreeTiB = math.Round(float64(storageStat.Space.AllocatableFree)/bytesToTiB*100) / 100
+				response.LogicalStorageTotalTiB = math.Round(storageStat.TotalBytes/bytesToTiB*100) / 100
+				response.LogicalStorageUsedTiB = math.Round(storageStat.UsedBytes/bytesToTiB*100) / 100
+				response.LogicalStorageFreeTiB = math.Round(storageStat.FreeBytes/bytesToTiB*100) / 100
 			}
 
 			log.Printf("Using VHI Panel stat: Total=%d vCPUs | System=%d | VMs=%d | Free=%d | Fenced=%d | Storage=%.2f TiB",
