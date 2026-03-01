@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -57,6 +58,13 @@ type ClusterUsage struct {
 
 // GET /api/v1/usage/cluster
 func getClusterUsage(w http.ResponseWriter, r *http.Request) {
+	// ---- Check Redis cache first ----
+	if cached := getCachedClusterUsage(); cached != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(cached)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
@@ -71,7 +79,29 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 	var response ClusterUsage
 
 	if panelClient != nil {
-		stat, panelErr := panelClient.GetStat()
+		// Run GetStat() and GetStorageStat() in parallel
+		var (
+			stat        *PanelStat
+			panelErr    error
+			storageStat *VStorageStat
+			storageErr  error
+			wg          sync.WaitGroup
+		)
+
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			stat, panelErr = panelClient.GetStat()
+		}()
+
+		go func() {
+			defer wg.Done()
+			storageStat, storageErr = panelClient.GetStorageStat()
+		}()
+
+		wg.Wait()
+
 		if panelErr != nil {
 			log.Printf("Warning: VHI Panel stat failed: %v, falling back to Nova", panelErr)
 		} else {
@@ -107,8 +137,8 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 				StorageFreeTiB:        math.Ceil(float64(stat.Compute.BlockCapacity-stat.Compute.BlockUsage)/bytesToTiB*100) / 100,
 			}
 
-			// Also fetch logical (vstorage) storage cluster stat via Prometheus/Grafana
-			if storageStat, storageErr := panelClient.GetStorageStat(); storageErr != nil {
+			// Attach logical storage from parallel GetStorageStat()
+			if storageErr != nil {
 				log.Printf("Warning: VHI Panel storage stat failed: %v", storageErr)
 			} else {
 				response.LogicalStorageTotalTiB = math.Round(storageStat.TotalBytes/bytesToTiB*100) / 100
@@ -119,6 +149,9 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Using VHI Panel stat: Total=%d vCPUs | System=%d | VMs=%d | Free=%d | Fenced=%d | Storage=%.2f TiB",
 				response.TotalVCPUs, response.SystemVCPUs, response.ReservedVCPUs,
 				response.FreeVCPUs, response.FencedVCPUs, response.ProvisionedStorageTiB)
+
+			// Store in Redis cache
+			setCachedClusterUsage(&response)
 
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(response)

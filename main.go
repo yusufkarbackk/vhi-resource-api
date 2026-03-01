@@ -35,6 +35,9 @@ func main() {
 		}
 	}
 
+	// Initialize Redis cache (optional — caching disabled if REDIS_HOST is not set)
+	redisClient = initRedis()
+
 	r := mux.NewRouter()
 
 	// Health check — no auth required
