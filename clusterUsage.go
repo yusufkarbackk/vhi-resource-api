@@ -43,11 +43,6 @@ type ClusterUsage struct {
 	FreeVCPUs  int     `json:"free_vcpus"`
 	FreeRAMGiB float64 `json:"free_ram_gib"`
 
-	// Provisioned storage (compute block storage from VHI panel stat)
-	ProvisionedStorageTiB float64 `json:"provisioned_storage_tib"`
-	StorageUsedTiB        float64 `json:"storage_used_tib"`
-	StorageFreeTiB        float64 `json:"storage_free_tib"`
-
 	// Logical storage (vstorage cluster — matches vstorage CLI: 287TB of 377TB)
 	LogicalStorageTotalTiB float64 `json:"logical_storage_total_tib"`
 	LogicalStorageUsedTiB  float64 `json:"logical_storage_used_tib"`
@@ -131,10 +126,6 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 
 				FreeVCPUs:  stat.Compute.VCPUsFree,
 				FreeRAMGiB: math.Ceil(float64(stat.Compute.VmMemFree) / bytesToGiB),
-
-				ProvisionedStorageTiB: math.Ceil(float64(stat.Compute.BlockCapacity)/bytesToTiB*100) / 100,
-				StorageUsedTiB:        math.Ceil(float64(stat.Compute.BlockUsage)/bytesToTiB*100) / 100,
-				StorageFreeTiB:        math.Ceil(float64(stat.Compute.BlockCapacity-stat.Compute.BlockUsage)/bytesToTiB*100) / 100,
 			}
 
 			// Attach logical storage from parallel GetStorageStat()
@@ -146,9 +137,9 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 				response.LogicalStorageFreeTiB = math.Round(storageStat.FreeBytes/bytesToTiB*100) / 100
 			}
 
-			log.Printf("Using VHI Panel stat: Total=%d vCPUs | System=%d | VMs=%d | Free=%d | Fenced=%d | Storage=%.2f TiB",
+			log.Printf("Using VHI Panel stat: Total=%d vCPUs | System=%d | VMs=%d | Free=%d | Fenced=%d",
 				response.TotalVCPUs, response.SystemVCPUs, response.ReservedVCPUs,
-				response.FreeVCPUs, response.FencedVCPUs, response.ProvisionedStorageTiB)
+				response.FreeVCPUs, response.FencedVCPUs)
 
 			// Store in Redis cache
 			setCachedClusterUsage(&response)
@@ -210,23 +201,6 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 	fencedRAMGiB := (float64(fencedPhysicalRAMMB) / 1024.0) * ramOvercommit
 	activeTotalVCPUs := int(float64(activePhysicalVCPUs) * vCPUOvercommit)
 	activeTotalRAMGiB := (float64(activePhysicalRAMMB) / 1024.0) * ramOvercommit
-
-	// Gnocchi provisioned storage
-	gnocchiURL := getEnv("GNOCCHI_URL", "")
-	var provisionedTiB float64
-	if gnocchiURL != "" {
-		gnocchiClient := NewGnocchiClient(GnocchiConfig{
-			BaseURL:  gnocchiURL,
-			Token:    adminToken,
-			Insecure: true,
-		})
-		gnocchiStorage, gnocchiErr := gnocchiClient.GetProvisionedStorage()
-		if gnocchiErr != nil {
-			log.Printf("Warning: Gnocchi failed: %v", gnocchiErr)
-		} else {
-			provisionedTiB = gnocchiStorage.TotalTiB
-		}
-	}
 
 	// Nova servers
 	servers, err := novaClient.ListAllServers()
@@ -290,8 +264,6 @@ func getClusterUsage(w http.ResponseWriter, r *http.Request) {
 		SystemRAMGiB:   math.Ceil(systemRAMGiB),
 		FreeVCPUs:      freeVCPUs,
 		FreeRAMGiB:     math.Ceil(freeRAMGiB),
-
-		ProvisionedStorageTiB: provisionedTiB,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
