@@ -38,6 +38,19 @@ func main() {
 	// Initialize Redis cache (optional — caching disabled if REDIS_HOST is not set)
 	redisClient = initRedis()
 
+	// Proactive token refresh — re-login every hour to prevent token expiry (401)
+	if panelClient != nil {
+		go func() {
+			for range time.Tick(1 * time.Hour) {
+				if err := panelClient.Login(); err != nil {
+					log.Printf("Warning: VHI Panel token refresh failed: %v", err)
+				} else {
+					log.Println("VHI Panel token refreshed successfully")
+				}
+			}
+		}()
+	}
+
 	r := mux.NewRouter()
 
 	// Health check — no auth required
