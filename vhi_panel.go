@@ -11,6 +11,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -25,6 +26,7 @@ type VHIPanelConfig struct {
 
 // VHIPanelClient interacts with the VHI admin panel API (port 8888).
 type VHIPanelClient struct {
+	mu             sync.Mutex // protects token, cookies, grafanaCookies
 	config         VHIPanelConfig
 	httpClient     *http.Client
 	token          string
@@ -133,10 +135,18 @@ func NewVHIPanelClient(config VHIPanelConfig) *VHIPanelClient {
 }
 
 // Login authenticates with the VHI panel and obtains a session token.
+// Thread-safe — acquires mutex internally.
 func (c *VHIPanelClient) Login() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.loginLocked()
+}
+
+// loginLocked is the internal login implementation.
+// Caller MUST hold c.mu before calling.
+func (c *VHIPanelClient) loginLocked() error {
 	loginURL := fmt.Sprintf("%s/api/v2/login", c.config.BaseURL)
 
-	// VHI panel login uses username + password
 	loginBody := map[string]string{
 		"username": c.config.Username,
 		"password": c.config.Password,
@@ -157,7 +167,11 @@ func (c *VHIPanelClient) Login() error {
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 
+	// Unlock during HTTP call to avoid blocking other goroutines
+	c.mu.Unlock()
 	resp, err := c.httpClient.Do(req)
+	c.mu.Lock()
+
 	if err != nil {
 		return fmt.Errorf("login request failed: %w", err)
 	}
@@ -171,7 +185,6 @@ func (c *VHIPanelClient) Login() error {
 		return fmt.Errorf("login failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Parse response — extract scoped_token
 	var loginResp struct {
 		ID          string `json:"id"`
 		Name        string `json:"name"`
@@ -185,18 +198,16 @@ func (c *VHIPanelClient) Login() error {
 		return fmt.Errorf("failed to parse login response: %w (body: %s)", err, string(body))
 	}
 
-	// Use scoped_token as the auth token for subsequent requests
 	if loginResp.ScopedToken != "" {
 		c.token = loginResp.ScopedToken
-		c.cookies = resp.Cookies() // save all cookies from login
+		c.cookies = resp.Cookies()
 		log.Printf("VHI Panel login successful, scoped_token obtained, %d cookies saved", len(c.cookies))
 		for _, ck := range c.cookies {
-			log.Printf("  → Cookie: name=%q value=%.20s...", ck.Name, ck.Value)
+			log.Printf("  → Cookie: name=%q value=%.8s***", ck.Name, ck.Value)
 		}
 		return nil
 	}
 
-	// Fallback to token field
 	if loginResp.Token != "" && loginResp.Token != "unscoped" {
 		c.token = loginResp.Token
 		log.Printf("VHI Panel login successful, token obtained")
@@ -215,15 +226,16 @@ func (c *VHIPanelClient) Login() error {
 // We do NOT need a separate Grafana form login — all the 405 endpoints we tried before
 // were dead ends.
 func (c *VHIPanelClient) loginGrafana() error {
+	c.mu.Lock()
 	// Ensure we have a VHI panel session first.
 	if c.token == "" {
-		if err := c.Login(); err != nil {
+		if err := c.loginLocked(); err != nil {
+			c.mu.Unlock()
 			return fmt.Errorf("VHI panel login required before Grafana SSO: %w", err)
 		}
 	}
 
-	// Build the session0 cookie list from the VHI panel login cookies.
-	// The panel returns a cookie named "session"; Grafana expects it as "session0".
+	// Copy cookies while holding the lock
 	var session0Cookies []*http.Cookie
 	for _, ck := range c.cookies {
 		cp := *ck
@@ -232,13 +244,12 @@ func (c *VHIPanelClient) loginGrafana() error {
 		}
 		session0Cookies = append(session0Cookies, &cp)
 	}
+	c.mu.Unlock()
 
 	if len(session0Cookies) == 0 {
 		return fmt.Errorf("no session cookies from VHI panel login — cannot do Grafana SSO")
 	}
 
-	// Hit /grafana/api/user with session0 — Grafana should validate via nginx SSO
-	// and return a grafana_session cookie.
 	grafanaUserURL := fmt.Sprintf("%s/grafana/api/user", c.config.BaseURL)
 	req, err := http.NewRequest("GET", grafanaUserURL, nil)
 	if err != nil {
@@ -250,7 +261,6 @@ func (c *VHIPanelClient) loginGrafana() error {
 		req.AddCookie(ck)
 	}
 
-	// Use a non-redirect client so we can capture Set-Cookie headers.
 	noRedirectClient := &http.Client{
 		Transport: c.httpClient.Transport,
 		Timeout:   15 * time.Second,
@@ -259,6 +269,7 @@ func (c *VHIPanelClient) loginGrafana() error {
 		},
 	}
 
+	// HTTP call without lock
 	resp, err := noRedirectClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("Grafana SSO request failed: %w", err)
@@ -268,17 +279,18 @@ func (c *VHIPanelClient) loginGrafana() error {
 
 	log.Printf("Grafana SSO /api/user → status %d", resp.StatusCode)
 
-	// Collect all cookies from the response.
-	c.grafanaCookies = session0Cookies // always carry session0
+	// Lock to write grafanaCookies
+	c.mu.Lock()
+	c.grafanaCookies = session0Cookies
 	for _, ck := range resp.Cookies() {
-		log.Printf("  → Grafana SSO cookie: name=%q value=%.30s...", ck.Name, ck.Value)
+		log.Printf("  → Grafana SSO cookie: name=%q value=%.8s***", ck.Name, ck.Value)
 		if ck.Name == "grafana_session" {
 			c.grafanaCookies = append(c.grafanaCookies, ck)
 			log.Printf("Grafana session obtained via SSO!")
 		}
 	}
+	c.mu.Unlock()
 
-	// If Grafana accepted the request (200 or redirect to dashboard), we're good.
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusSeeOther {
 		log.Printf("Grafana SSO succeeded (status %d)", resp.StatusCode)
 		return nil
@@ -290,7 +302,11 @@ func (c *VHIPanelClient) loginGrafana() error {
 // doGrafanaGet performs a GET to a Grafana endpoint with grafana session cookies, auto re-login on 401.
 func (c *VHIPanelClient) doGrafanaGet(fullURL string) ([]byte, error) {
 	for attempt := 0; attempt < 2; attempt++ {
-		if len(c.grafanaCookies) == 0 {
+		c.mu.Lock()
+		hasGrafanaCookies := len(c.grafanaCookies) > 0
+		c.mu.Unlock()
+
+		if !hasGrafanaCookies {
 			if err := c.loginGrafana(); err != nil {
 				return nil, fmt.Errorf("grafana login failed: %w", err)
 			}
@@ -301,7 +317,9 @@ func (c *VHIPanelClient) doGrafanaGet(fullURL string) ([]byte, error) {
 			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
 		req.Header.Set("Accept", "application/json")
-		// Send both grafana_session AND session0 cookies — Grafana SSO requires both
+
+		// Copy cookies under lock
+		c.mu.Lock()
 		for _, cookie := range c.grafanaCookies {
 			req.AddCookie(cookie)
 		}
@@ -312,7 +330,9 @@ func (c *VHIPanelClient) doGrafanaGet(fullURL string) ([]byte, error) {
 			}
 			req.AddCookie(&cp)
 		}
+		c.mu.Unlock()
 
+		// HTTP call without lock
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("grafana request failed: %w", err)
@@ -324,7 +344,9 @@ func (c *VHIPanelClient) doGrafanaGet(fullURL string) ([]byte, error) {
 
 		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
 			log.Printf("Grafana session expired, re-logging in...")
+			c.mu.Lock()
 			c.grafanaCookies = nil
+			c.mu.Unlock()
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
@@ -338,11 +360,22 @@ func (c *VHIPanelClient) doGrafanaGet(fullURL string) ([]byte, error) {
 // doAuthGet performs a GET request with auth headers, auto re-login on 401.
 func (c *VHIPanelClient) doAuthGet(endpoint string) ([]byte, error) {
 	for attempt := 0; attempt < 2; attempt++ {
+		c.mu.Lock()
 		if c.token == "" {
-			if err := c.Login(); err != nil {
+			if err := c.loginLocked(); err != nil {
+				c.mu.Unlock()
 				return nil, fmt.Errorf("panel login failed: %w", err)
 			}
 		}
+
+		// Copy token and cookies while holding lock
+		token := c.token
+		cookiesCopy := make([]*http.Cookie, len(c.cookies))
+		for i, ck := range c.cookies {
+			cp := *ck
+			cookiesCopy[i] = &cp
+		}
+		c.mu.Unlock()
 
 		url := fmt.Sprintf("%s%s", c.config.BaseURL, endpoint)
 		req, err := http.NewRequest("GET", url, nil)
@@ -350,12 +383,12 @@ func (c *VHIPanelClient) doAuthGet(endpoint string) ([]byte, error) {
 			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
 
-		req.Header.Set("X-Auth-Token", c.token)
+		req.Header.Set("X-Auth-Token", token)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json, text/plain, */*")
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req.Header.Set("X-Session-Id", "0")
-		for _, cookie := range c.cookies {
+		for _, cookie := range cookiesCopy {
 			cp := *cookie
 			if cp.Name == "session" {
 				cp.Name = "session0"
@@ -363,6 +396,7 @@ func (c *VHIPanelClient) doAuthGet(endpoint string) ([]byte, error) {
 			req.AddCookie(&cp)
 		}
 
+		// HTTP call without lock
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("request failed: %w", err)
@@ -373,10 +407,11 @@ func (c *VHIPanelClient) doAuthGet(endpoint string) ([]byte, error) {
 		log.Printf("VHI Panel %s response status: %d", endpoint, resp.StatusCode)
 
 		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
-			// Token expired — force re-login and retry once
 			log.Printf("VHI Panel token expired, re-logging in...")
+			c.mu.Lock()
 			c.token = ""
 			c.cookies = nil
+			c.mu.Unlock()
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
@@ -529,7 +564,10 @@ func (c *VHIPanelClient) GetStorageStat() (*VStorageStat, error) {
 	default:
 		// --- Option 3: Grafana SSO cookies (fallback, likely to fail) ---
 		log.Printf("vStorage source: Grafana SSO proxy (set PROMETHEUS_URL or GRAFANA_API_KEY for better results)")
-		if c.token == "" {
+		c.mu.Lock()
+		needsLogin := c.token == ""
+		c.mu.Unlock()
+		if needsLogin {
 			if err := c.Login(); err != nil {
 				return nil, fmt.Errorf("login failed: %w", err)
 			}

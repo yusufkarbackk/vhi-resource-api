@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -53,6 +54,9 @@ func main() {
 
 	r := mux.NewRouter()
 
+	// Global rate limiting per IP
+	r.Use(rateLimitMiddleware)
+
 	// Health check — no auth required
 	r.HandleFunc("/health", healthCheck).Methods("GET")
 
@@ -96,7 +100,7 @@ func bearerAuth(next http.Handler) http.Handler {
 		}
 
 		token := auth[7:]
-		if token != expected {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="VHI Billing API"`)
 			http.Error(w, `{"error":"invalid bearer token"}`, http.StatusUnauthorized)
 			return
@@ -118,7 +122,7 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 func getCPUBilling(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	instanceID := vars["instance_id"]
-	fmt.Println("Fetching CPU billing for instance ID:", instanceID)
+	log.Printf("Fetching CPU billing for instance ID: %s", instanceID)
 	// Get query parameters
 	startDate := r.URL.Query().Get("start_date")
 	endDate := r.URL.Query().Get("end_date")
@@ -138,8 +142,6 @@ func getCPUBilling(w http.ResponseWriter, r *http.Request) {
 		Insecure: true,
 	}
 
-	fmt.Println(config.BaseURL)
-
 	client := NewGnocchiClient(config)
 
 	// Get instance resource
@@ -155,7 +157,7 @@ func getCPUBilling(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "CPU metric not found for instance", http.StatusNotFound)
 		return
 	}
-	fmt.Println("Found CPU metric ID:", cpuMetricID)
+
 	// Get CPU measures
 	measures, err := client.GetMetricMeasures(cpuMetricID, startDate, endDate, 300) // 1 hour granularity
 	if err != nil {

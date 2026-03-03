@@ -202,7 +202,6 @@ func GetAdminToken(ctx context.Context) (string, error) {
 		BaseURL:  baseURL,
 		Insecure: true,
 	})
-	//fmt.Println(creds)
 	return client.getAdminToken(ctx, creds)
 }
 
@@ -369,10 +368,8 @@ func ListProjectsForDomainName(ctx context.Context, token, domainName string) ([
 	})
 
 	base := strings.TrimRight(client.config.BaseURL, "/")
-	//fmt.Println(base)
 	// 1) Resolve domain name -> domain id
 	domainURL := fmt.Sprintf("%s:5000/v3/domains?name=%s", base, url.QueryEscape(domainName))
-	//fmt.Println(domainURL)
 	req, err := http.NewRequestWithContext(ctx, "GET", domainURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create domains request: %w", err)
